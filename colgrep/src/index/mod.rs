@@ -478,7 +478,7 @@ fn run_metadata_stage(
             &index_path,
             &metadata,
             &chunk.doc_ids,
-            &next_plaid::FtsTokenizer::Trigram,
+            &next_plaid::FtsTokenizer::IdentifierAware,
         ) {
             eprintln!("⚠️  FTS indexing failed (non-fatal): {}", e);
         }
@@ -2025,12 +2025,11 @@ const IGNORED_DIRS: &[&str] = &[
     "third_party",
     "third-party",
     "external",
-    // Build outputs
+    // Build outputs.
     "target",
     "build",
     "dist",
     "out",
-    "output",
     "bin",
     "obj",
     // Python
@@ -3214,13 +3213,21 @@ impl Searcher {
 
     /// Run FTS5 keyword search if the text index is available and the query
     /// remains non-empty after sanitization.
+    ///
+    /// Uses [`next_plaid::text_search::sanitize_fts5_query_or`] because the
+    /// index is built with [`next_plaid::FtsTokenizer::IdentifierAware`]:
+    /// each identifier
+    /// in the corpus has been pre-split into its compound + camel/snake parts,
+    /// so OR semantics let a natural-language query match documents that
+    /// contain *any* relevant sub-part. BM25 still rewards documents that hit
+    /// more query terms.
     pub fn fts5_search(
         &self,
         query: &str,
         top_k: usize,
         subset: Option<&[i64]>,
     ) -> Option<next_plaid::QueryResult> {
-        let sanitized_query = next_plaid::text_search::sanitize_fts5_query(query);
+        let sanitized_query = next_plaid::text_search::sanitize_fts5_query_or(query);
         if sanitized_query.is_empty() {
             return None;
         }
@@ -3285,8 +3292,11 @@ impl Searcher {
         alpha: f32,
     ) -> Result<Vec<SearchResult>> {
         let query_emb = self.encode_query(query)?;
-        let fts5 = self.fts5_search(query, top_k * 3, subset);
-        self.search_hybrid_with_embedding(&query_emb, query, top_k, subset, alpha, fts5.as_ref())
+        // Pass None so `search_hybrid_with_embedding` fetches FTS5 with its
+        // own `fetch_k` (≥200), matching the semantic-side over-fetch.
+        // Asymmetric pools (e.g. 200 semantic vs only 30 BM25) bias the
+        // min-max fusion toward the side with more candidates.
+        self.search_hybrid_with_embedding(&query_emb, query, top_k, subset, alpha, None)
     }
 
     /// Hybrid search using a pre-computed query embedding and optional cached
@@ -3300,7 +3310,19 @@ impl Searcher {
         alpha: f32,
         fts5_results: Option<&next_plaid::QueryResult>,
     ) -> Result<Vec<SearchResult>> {
-        let fetch_k = top_k * 3;
+        // Over-fetch generously so that after path-noise penalty + boosts
+        // + file collapse we still return exactly `top_k` distinct files
+        // (and not a smaller, "approximate" set) — `-k` is a hard
+        // contract from the user's perspective.
+        //
+        // The cost is small: each extra candidate is a single SQLite row
+        // read plus a few constant-time score adjustments. We cap at
+        // `num_documents()` so we never request more rows than the index
+        // actually contains.
+        let fetch_k = std::cmp::min(
+            std::cmp::max(top_k * 20, 200),
+            self.index.num_documents().max(top_k),
+        );
         let params = SearchParameters {
             top_k: fetch_k,
             ..Default::default()
@@ -3309,6 +3331,13 @@ impl Searcher {
             .index
             .search(query_emb, &params, subset)
             .context("Semantic search failed")?;
+        trace_log(
+            query,
+            "semantic",
+            &semantic.passage_ids,
+            &semantic.scores,
+            20,
+        );
 
         let owned_fts5;
         let keyword = match fts5_results {
@@ -3349,34 +3378,129 @@ impl Searcher {
             }
         };
 
+        // Score-based min-max fusion: with the identifier-aware BM25 retriever,
+        // FTS5 recall@200 is ~99.6%, so the relative-score combiner outperforms
+        // pure rank-based RRF (rank-RRF caps both retrievers' contributions
+        // even when one is much higher quality on a given query).
+        //
+        // Fuse into the larger `fetch_k` pool (not `top_k`) so the path-noise
+        // reranker can pull a strong-but-buried implementation file above
+        // tests / examples that happened to rank higher in the raw fusion.
+        if let Some(kw) = keyword {
+            trace_log(query, "bm25", &kw.passage_ids, &kw.scores, 20);
+        }
+
         let (fused_ids, fused_scores) = if let Some(kw) = keyword {
             if kw.passage_ids.is_empty() {
                 (semantic.passage_ids, semantic.scores)
             } else {
-                next_plaid::text_search::fuse_rrf(
+                next_plaid::text_search::fuse_relative_score(
                     &semantic.passage_ids,
+                    &semantic.scores,
                     &kw.passage_ids,
+                    &kw.scores,
                     alpha,
-                    top_k,
+                    fetch_k,
                 )
             }
         } else {
             (semantic.passage_ids, semantic.scores)
         };
+        trace_log(query, "fused", &fused_ids, &fused_scores, 20);
 
         let metadata = filtering::get(&self.index_path, None, &[], Some(&fused_ids))
             .context("Failed to retrieve metadata")?;
 
-        let search_results: Vec<SearchResult> = metadata
-            .into_iter()
+        let apply_penalty = crate::ranking::should_apply_path_penalty(query);
+
+        // Index returned metadata rows by `_subset_` id so we can pair each
+        // row to its score safely. Using `Vec::zip` here was a bug: if any
+        // id in `fused_ids` had no METADATA row (stale FTS5 reference),
+        // every subsequent (meta, score) pair shifted by one — silently
+        // attaching the wrong score to the wrong unit.
+        let mut meta_by_id: std::collections::HashMap<i64, serde_json::Value> =
+            std::collections::HashMap::with_capacity(metadata.len());
+        for mut m in metadata {
+            if let Some(id) = m.get("_subset_").and_then(|v| v.as_i64()) {
+                fix_sqlite_types(&mut m);
+                meta_by_id.insert(id, m);
+            }
+        }
+
+        let mut search_results: Vec<SearchResult> = fused_ids
+            .iter()
             .zip(fused_scores.iter())
-            .filter_map(|(mut meta, &score)| {
-                fix_sqlite_types(&mut meta);
-                serde_json::from_value::<CodeUnit>(meta)
-                    .ok()
-                    .map(|unit| SearchResult { unit, score })
+            .filter_map(|(&id, &score)| {
+                let meta = meta_by_id.remove(&id)?;
+                serde_json::from_value::<CodeUnit>(meta).ok().map(|unit| {
+                    let mut final_score = score;
+                    if apply_penalty {
+                        let file_str = unit.file.to_string_lossy();
+                        final_score *= crate::ranking::file_path_penalty(&file_str);
+                    }
+                    SearchResult {
+                        unit,
+                        score: final_score,
+                    }
+                })
             })
             .collect();
+        trace_log_results(query, "after_path_penalty", &search_results, 30);
+
+        // Boost candidates whose file-path stem matches a query token —
+        // queries like "interceptor manager" map almost surgically to
+        // `InterceptorManager.js`, and the path tells us so cheaply.
+        crate::ranking::apply_path_stem_boost(
+            &mut search_results,
+            query,
+            |r| r.unit.file.to_str().unwrap_or(""),
+            |r| r.score,
+            |r, s| r.score = s,
+        );
+        trace_log_results(query, "after_path_stem_boost", &search_results, 30);
+
+        // Boost units whose tree-sitter name matches a query token. Applied
+        // before file-coherence so the symbol the user actually asked about
+        // can lift its parent file above neighbours that merely reference it.
+        crate::ranking::apply_definition_boost(
+            &mut search_results,
+            query,
+            |r| r.unit.name.as_str(),
+            |r| {
+                matches!(
+                    r.unit.unit_type,
+                    crate::UnitType::Function
+                        | crate::UnitType::Method
+                        | crate::UnitType::Class
+                        | crate::UnitType::Constant
+                )
+            },
+            |r| r.score,
+            |r, s| r.score = s,
+        );
+        trace_log_results(query, "after_definition_boost", &search_results, 30);
+
+        // Boost files that appear in multiple candidate units: the file with
+        // the most cumulative score in the pool gets `+0.2 * max_score` on
+        // its top-scoring unit; others get a proportional share.
+        crate::ranking::apply_file_coherence_boost(
+            &mut search_results,
+            |r| r.unit.file.to_str().unwrap_or(""),
+            |r| r.score,
+            |r, s| r.score = s,
+        );
+        trace_log_results(query, "after_coherence_boost", &search_results, 30);
+
+        // Re-sort after the penalty + boosts adjust scores, then collapse
+        // to one entry per file (merging start/end lines to cover every
+        // matched unit from that file) before truncating to top_k.
+        search_results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        search_results = collapse_by_file(search_results, top_k);
+        trace_log_results(query, "final", &search_results, 30);
 
         Ok(search_results)
     }
@@ -3384,6 +3508,122 @@ impl Searcher {
     pub fn num_documents(&self) -> usize {
         self.index.num_documents()
     }
+}
+
+/// Emit a single JSON line to stderr describing one stage of the hybrid
+/// pipeline, when `COLGREP_TRACE` is truthy. No-op (essentially free) when
+/// the env var is unset, so we can leave the call sites in release builds.
+///
+/// The shape is intentionally simple — one object per call:
+///   {"stage":"fused","query":"...","ids":[...],"scores":[...]}
+/// `diagnose_misses.py` picks these up via stderr and aggregates them per
+/// query so the user can see which stage demotes the relevant file.
+fn trace_log(query: &str, stage: &str, ids: &[i64], scores: &[f32], limit: usize) {
+    if !trace_enabled() {
+        return;
+    }
+    let n = ids.len().min(scores.len()).min(limit);
+    // Build the JSON manually to avoid an extra dep and keep things fast.
+    let mut s = String::with_capacity(64 + n * 32);
+    s.push_str("{\"stage\":\"");
+    s.push_str(stage);
+    s.push_str("\",\"query\":");
+    json_escape(&mut s, query);
+    s.push_str(",\"ids\":[");
+    for (i, id) in ids.iter().take(n).enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&id.to_string());
+    }
+    s.push_str("],\"scores\":[");
+    for (i, sc) in scores.iter().take(n).enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!("{:.6}", sc));
+    }
+    s.push_str("]}");
+    eprintln!("__COLGREP_TRACE__ {}", s);
+}
+
+/// Same as [`trace_log`] but accepts a slice of `SearchResult` so callers
+/// can dump the post-rerank pool with file paths included.
+fn trace_log_results(query: &str, stage: &str, results: &[SearchResult], limit: usize) {
+    if !trace_enabled() {
+        return;
+    }
+    let n = results.len().min(limit);
+    let mut s = String::with_capacity(64 + n * 64);
+    s.push_str("{\"stage\":\"");
+    s.push_str(stage);
+    s.push_str("\",\"query\":");
+    json_escape(&mut s, query);
+    s.push_str(",\"results\":[");
+    for (i, r) in results.iter().take(n).enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str("{\"file\":");
+        json_escape(&mut s, &r.unit.file.to_string_lossy());
+        s.push_str(&format!(",\"score\":{:.6}}}", r.score));
+    }
+    s.push_str("]}");
+    eprintln!("__COLGREP_TRACE__ {}", s);
+}
+
+fn trace_enabled() -> bool {
+    matches!(
+        std::env::var("COLGREP_TRACE").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
+fn json_escape(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Collapse search results so each file appears at most once.
+///
+/// Walks `results` (which the caller has already sorted by score descending)
+/// and for every file keeps the first / highest-scoring unit as the leader,
+/// then extends that leader's line range to cover every subsequent unit from
+/// the same file: `line = min(line_i)`, `end_line = max(end_line_i)`.
+///
+/// Truncates to `top_k` unique files. The leader's other metadata (name,
+/// signature, code, ...) is left untouched so consumers can still display
+/// the top unit's structural information.
+fn collapse_by_file(results: Vec<SearchResult>, top_k: usize) -> Vec<SearchResult> {
+    let mut by_file: std::collections::HashMap<std::path::PathBuf, usize> =
+        std::collections::HashMap::new();
+    let mut out: Vec<SearchResult> = Vec::with_capacity(top_k.min(results.len()));
+    for r in results {
+        if let Some(&idx) = by_file.get(&r.unit.file) {
+            // Merge: cover the full span of all candidates from this file.
+            let leader = &mut out[idx];
+            leader.unit.line = leader.unit.line.min(r.unit.line);
+            leader.unit.end_line = leader.unit.end_line.max(r.unit.end_line);
+        } else {
+            if out.len() >= top_k {
+                continue;
+            }
+            by_file.insert(r.unit.file.clone(), out.len());
+            out.push(r);
+        }
+    }
+    out
 }
 
 /// SQLite stores booleans as integers and arrays as JSON strings. Normalize
