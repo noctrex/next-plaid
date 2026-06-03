@@ -25,7 +25,7 @@ from .models import (
     RerankResponse,
 )
 
-__version__ = "1.5.1"
+__version__ = "1.5.2"
 __all__ = [
     "NextPlaidClient",
     "AsyncNextPlaidClient",
