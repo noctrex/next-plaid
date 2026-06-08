@@ -999,7 +999,12 @@ impl IndexBuilder {
                     }
                 }
             };
-            #[cfg(not(any(feature = "cuda", feature = "directml", feature = "migraphx", feature = "coreml")))]
+            #[cfg(not(any(
+                feature = "cuda",
+                feature = "directml",
+                feature = "migraphx",
+                feature = "coreml"
+            )))]
             let (num_sessions, execution_provider) = {
                 let _ = num_units;
 
