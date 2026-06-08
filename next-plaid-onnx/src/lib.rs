@@ -364,7 +364,7 @@ fn configure_auto_provider(builder: SessionBuilder) -> Result<SessionBuilder> {
     }
 
     #[cfg(feature = "coreml")]
-    {
+    if !force_cpu {
         if let Ok(b) = builder
             .clone()
             .with_execution_providers([CoreMLExecutionProvider::default().build()])
